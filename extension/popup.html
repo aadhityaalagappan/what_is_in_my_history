@@ -1,0 +1,89 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>History Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="app-header">
+        <div class="logo">💬</div>
+        <div class="hgroup">
+          <h1>History Chat</h1>
+          <p>Ask about your browsing</p>
+        </div>
+        <div class="header-actions">
+          <button id="clearChatBtn" class="icon-btn" title="Clear chat">🗑️</button>
+          <button id="themeBtn" class="icon-btn" title="Toggle theme">🌓</button>
+          <button id="settingsBtn" class="icon-btn" title="Settings">⚙️</button>
+        </div>
+      </header>
+
+      <div class="status">
+        <div class="row">
+          <span id="statusText">Ready</span>
+        </div>
+        <div class="row gap">
+          <button id="syncBtn" class="btn btn-primary">Sync history</button>
+          <span class="pill" id="lastSync">Never</span>
+        </div>
+      </div>
+
+      <div class="suggestions" id="suggestions">
+        <button class="chip">What songs did I listen to yesterday?</button>
+        <button class="chip">Which research paper was I reading last Tuesday?</button>
+        <button class="chip">Show articles I read about transformers last week</button>
+      </div>
+
+      <div id="log" class="chat" aria-live="polite"></div>
+
+      <form id="qform" class="form" autocomplete="off">
+        <textarea id="q" rows="1" placeholder="Ask e.g. What songs did I hear yesterday? (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="askBtn" class="btn btn-primary">Ask</button>
+      </form>
+    </div>
+
+    <div id="overlay" class="overlay hidden" aria-hidden="true">
+      <div class="spinner"></div>
+      <div class="overlay-text">Syncing your history…</div>
+    </div>
+
+    <dialog id="settingsDialog" class="modal">
+      <form method="dialog" class="modal-body">
+        <h3>Settings</h3>
+        <label class="lbl">API Base
+          <input id="apiBaseInput" type="text" placeholder="http://localhost:8001" />
+        </label>
+        <div class="grid2">
+          <label class="lbl">Days to collect
+            <input id="daysInput" type="number" min="1" max="365" value="30" />
+          </label>
+          <label class="lbl">Max items
+            <input id="maxInput" type="number" min="100" max="10000" step="100" value="3000" />
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button value="cancel" class="btn btn-ghost">Cancel</button>
+          <button id="saveSettingsBtn" value="default" class="btn btn-primary">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="clearChatDialog" class="modal">
+      <form method="dialog" class="modal-body">
+        <h3>Clear Chat History?</h3>
+        <p>This will delete all messages from this chat. Your browsing history will remain intact.</p>
+        <div class="modal-actions">
+          <button value="cancel" class="btn btn-ghost">Cancel</button>
+          <button id="confirmClearBtn" value="confirm" class="btn btn-danger">Clear Chat</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toasts" class="toasts"></div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
