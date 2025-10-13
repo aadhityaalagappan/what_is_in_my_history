@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE = 'http://localhost:8001';
+const DEFAULT_API_BASE = 'https://whatisinmyhistory-production.up.railway.app';
 const CHAT_KEY = 'history_chat_mem';
 const HISTORY_KEY = 'historyData';
 const LAST_SYNC_KEY = 'lastUpdate';
