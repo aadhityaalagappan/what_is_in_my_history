@@ -219,28 +219,6 @@ def extract_domain(query: str) -> Optional[str]:
         if k in q: return v
     return None
 
-def build_where(date_filter: Optional[str], domain_filter: Optional[str],
-                hour_filter: Optional[int]=None, day_filter: Optional[int]=None) -> Dict[str, Any]:
-    where: Dict[str, Any] = {}
-    
-    if date_filter:
-        if len(date_filter) == 7:
-            where["visit_date"] = {
-                "$gte": f"{date_filter}-01",
-                "$lte": f"{date_filter}-31"
-            }
-        else:
-            where["visit_date"] = {"$eq": date_filter}
-    
-    if domain_filter: 
-        where["domain"] = {"$eq": domain_filter}
-    if hour_filter is not None: 
-        where["hour"] = {"$eq": hour_filter}
-    if day_filter is not None: 
-        where["dayOfWeek"] = {"$eq": day_filter}
-    
-    return where
-
 def mk_sources(docs: List[str], metas: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     out=[]
     for i in range(len(docs)):
@@ -287,29 +265,72 @@ async def distill_and_store_memory(user_id: str, question: str, answer: str):
     mem_col = col_memory(user_id)
     mem_id = f"mem:{int(datetime.utcnow().timestamp())}"
     mem_col.add(ids=[mem_id], documents=[summary], embeddings=vec, metadatas=[{"user_id":user_id, "ts":datetime.utcnow().isoformat()}])
+
+def extract_artist_from_query(query: str, available_titles: List[str]) -> Optional[str]:
+    """Dynamically extract artist name from query"""
+    q_lower = query.lower()
     
-def expand_music_query(query: str) -> str:
-    """Expand music-related queries with context keywords"""
-    q = query.lower()
-    expansions = []
+    stop_words = ['songs', 'song', 'music', 'by', 'from', 'what', 'which', 'show', 'me', 
+                  'did', 'i', 'listen', 'to', 'today', 'yesterday', 'last', 'week', 
+                  'the', 'a', 'an', 'my', 'all', 'any', 'that', 'in', 'on']
     
-    if 'piano' in q:
-        expansions.extend(['piano', 'acoustic', 'instrumental'])
-    if 'girl' in q or 'woman' in q or 'female' in q:
-        expansions.extend(['female', 'woman', 'girl', 'she', 'her'])
-    if 'boy' in q or 'man' in q or 'male' in q:
-        expansions.extend(['male', 'man', 'boy', 'he', 'him'])
-    if 'sings' in q or 'singing' in q:
-        expansions.extend(['vocals', 'singer', 'vocal', 'performance'])
-    if 'duet' in q or 'together' in q:
-        expansions.extend(['duet', 'featuring', 'ft.', 'collaboration', 'with'])
+    words = q_lower.split()
+    query_tokens = [w for w in words if w not in stop_words and len(w) > 2]
     
-    if any(word in q for word in ['song', 'music', 'track']):
-        expansions.extend(['official', 'audio', 'music video', 'lyrics'])
+    if not query_tokens:
+        return None
     
-    if expansions:
-        return f"{query} {' '.join(set(expansions))}"
-    return query    
+    all_artists = set()
+    for title in available_titles:
+        title_lower = title.lower()
+        
+        if ' - ' in title:
+            main_artist = title.split(' - ', 1)[0].strip()
+            main_artist = re.sub(r'^\(\d+\)\s*', '', main_artist)
+            all_artists.add(main_artist)
+        
+        feat_patterns = [
+            r'\(feat\.?\s+([^)]+)\)',
+            r'\(ft\.?\s+([^)]+)\)',
+            r'feat\.?\s+([^,\)]+)',
+            r'ft\.?\s+([^,\)]+)',
+            r'featuring\s+([^,\)]+)',
+            r'with\s+([^,\)]+)'
+        ]
+        
+        for pattern in feat_patterns:
+            matches = re.finditer(pattern, title_lower)
+            for match in matches:
+                feat_artist = match.group(1).strip()
+                feat_artist = re.sub(r'^\(\d+\)\s*', '', feat_artist)
+                all_artists.add(feat_artist)
+    
+    best_match = None
+    best_score = 0
+    
+    for artist in all_artists:
+        artist_lower = artist.lower()
+        artist_tokens = artist_lower.split()
+        
+        if artist_lower in q_lower:
+            return artist
+        
+        score = 0
+        for query_token in query_tokens:
+            for artist_token in artist_tokens:
+                if query_token == artist_token:
+                    score += 2
+                elif query_token in artist_token or artist_token in query_token:
+                    score += 1
+        
+        if score > best_score:
+            best_score = score
+            best_match = artist
+    
+    if best_score >= 1:
+        return best_match
+    
+    return None
 
 @app.post("/api/history/to_embeddings")
 async def rebuild_embeddings(batch: HistoryBatch):
@@ -414,296 +435,9 @@ async def upsert_items(batch: HistoryBatch):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upsert failed: {e}")
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
-    try:
-        ensure_api_key()
-        user_id = get_user_id(req.user_id)
-        emb = embedding_client()
-        hist = col_history(user_id)
-        mem = col_memory(user_id)
-
-        date_filter = extract_date(req.message)
-        domain_filter = extract_domain(req.message)
-        where_hist = build_where(date_filter, domain_filter)
-
-        enhanced = req.message
-        if date_filter:
-            try:
-                if len(date_filter) == 7:
-                    dt = datetime.strptime(date_filter + "-01", "%Y-%m-%d")
-                    enhanced += f" {dt.strftime('%B %Y')}"
-                else:
-                    dt = datetime.strptime(date_filter, "%Y-%m-%d")
-                    enhanced += f" {dt.strftime('%A %B %d %Y')}"
-            except: 
-                pass
-        if any(word in req.message.lower() for word in ['song', 'music', 'track', 'sing', 'artist']):
-            enhanced = expand_music_query(enhanced)    
-        
-        qvec = await asyncio.to_thread(emb.embed_query, enhanced)
-
-        res_h = hist.query(
-            query_embeddings=[qvec], 
-            n_results=req.top_k,
-            **({"where": where_hist} if where_hist else {})
-        )
-        docs_h = (res_h.get("documents") or [[]])[0]
-        metas_h = (res_h.get("metadatas") or [[]])[0]
-
-        if not docs_h and date_filter:
-            res_h = hist.query(query_embeddings=[qvec], n_results=100)
-            all_docs = (res_h.get("documents") or [[]])[0]
-            all_metas = (res_h.get("metadatas") or [[]])[0]
-            
-            docs_h, metas_h = [], []
-            for i, meta in enumerate(all_metas):
-                visit_date = meta.get('visit_date', '')
-                if visit_date.startswith(date_filter):
-                    docs_h.append(all_docs[i])
-                    metas_h.append(meta)
-            
-            docs_h = docs_h[:req.top_k]
-            metas_h = metas_h[:req.top_k]
-
-        try:
-            res_m = mem.query(query_embeddings=[qvec], n_results=10)
-            docs_m = (res_m.get("documents") or [[]])[0]
-            metas_m = (res_m.get("metadatas") or [[]])[0]
-        except Exception:
-            docs_m, metas_m = [], []
-
-        ctx_docs = docs_m + docs_h
-        ctx_meta = metas_m + metas_h
-        
-        if not ctx_docs:
-            if date_filter:
-                all_results = hist.get(limit=50)
-                available_dates = set()
-                if all_results and all_results.get('metadatas'):
-                    available_dates = set([m.get('visit_date', 'unknown') for m in all_results['metadatas']])
-                
-                return ChatResponse(
-                    success=True,
-                    answer=f"I don't have any browsing history from {date_filter}. Available dates: {', '.join(sorted(available_dates)[:10])}",
-                    sources=[]
-                )
-            return ChatResponse(success=True, answer="I couldn't find anything. Try syncing your history first.", sources=[])
-
-        sources = mk_sources(docs_h, metas_h)
-        context_text = build_context(ctx_docs, ctx_meta)
-
-        sys = """You are a browsing history assistant. Follow these rules:
-
-RULES:
-1. Answer based on the information in the provided sources
-2. Extract song titles, artist names, and content from source TITLES and CONTENT fields
-3. Check VISIT DATE - prioritize sources matching the requested timeframe
-4. Use [#n] citations for claims
-5. If you see relevant information in titles/content, USE IT - don't refuse to answer
-6. For music queries, extract song and artist names from YouTube titles or Spotify metadata
-
-IMPORTANT: 
-- YouTube titles often contain "Artist - Song Title" format
-- Source titles ARE valid data - extract information from them
-- Don't refuse to answer when data is clearly present in titles"""
-
-        user_prompt = f"""QUESTION: {req.message}
-
-BROWSING HISTORY SOURCES:
-{context_text}
-
-Answer based on the sources above. Extract information from titles, URLs, and content. Use [#n] citations."""
-
-        messages = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user_prompt}
-        ]
-        
-        answer = await chat_complete(messages)
-        asyncio.create_task(distill_and_store_memory(user_id, req.message, answer))
-
-        return ChatResponse(success=True, answer=answer, sources=sources)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat failed: {e}")
-@app.get("/health")
-async def health():
-    return {"status":"ok","ts": datetime.utcnow().isoformat()}
-
-
-def extract_artist_from_query(query: str, available_artists: List[str]) -> Optional[str]:
-
-    q_lower = query.lower()
-    
-    stop_words = ['songs', 'song', 'music', 'by', 'from', 'what', 'which', 'show', 'me', 
-                  'did', 'i', 'listen', 'to', 'today', 'yesterday', 'last', 'week', 
-                  'the', 'a', 'an', 'my', 'all', 'any']
-    
-    words = q_lower.split()
-    query_tokens = [w for w in words if w not in stop_words]
-    
-    best_match = None
-    best_score = 0
-    
-    for artist in available_artists:
-        artist_lower = artist.lower()
-        artist_tokens = artist_lower.split()
-        
-        if artist_lower in q_lower:
-            return artist
-        
-        for token in query_tokens:
-            if token in artist_tokens:
-                score = sum(1 for t in artist_tokens if t in query_tokens)
-                if score > best_score:
-                    best_score = score
-                    best_match = artist
-    
-    if best_score >= 1:
-        return best_match
-    
-    return None
-
-
-def extract_artist_from_query(query: str, available_titles: List[str]) -> Optional[str]:
-
-    q_lower = query.lower()
-    
-    stop_words = ['songs', 'song', 'music', 'by', 'from', 'what', 'which', 'show', 'me', 
-                  'did', 'i', 'listen', 'to', 'today', 'yesterday', 'last', 'week', 
-                  'the', 'a', 'an', 'my', 'all', 'any', 'that']
-    
-    words = q_lower.split()
-    query_tokens = [w for w in words if w not in stop_words and len(w) > 2]
-    
-    if not query_tokens:
-        return None
-    
-    all_artists = set()
-    for title in available_titles:
-        title_lower = title.lower()
-        
-        if ' - ' in title:
-            main_artist = title.split(' - ', 1)[0].strip()
-            main_artist = re.sub(r'^\(\d+\)\s*', '', main_artist)
-            all_artists.add(main_artist)
-        
-        feat_patterns = [
-            r'\(feat\.?\s+([^)]+)\)',
-            r'\(ft\.?\s+([^)]+)\)',
-            r'feat\.?\s+([^,\)]+)',
-            r'ft\.?\s+([^,\)]+)',
-            r'featuring\s+([^,\)]+)',
-            r'with\s+([^,\)]+)'
-        ]
-        
-        for pattern in feat_patterns:
-            matches = re.finditer(pattern, title_lower)
-            for match in matches:
-                feat_artist = match.group(1).strip()
-                feat_artist = re.sub(r'^\(\d+\)\s*', '', feat_artist)
-                all_artists.add(feat_artist)
-    
-    best_match = None
-    best_score = 0
-    
-    for artist in all_artists:
-        artist_lower = artist.lower()
-        artist_tokens = artist_lower.split()
-        
-        if artist_lower in q_lower:
-            return artist
-        
-        score = 0
-        for query_token in query_tokens:
-            for artist_token in artist_tokens:
-                if query_token == artist_token:
-                    score += 2
-                elif query_token in artist_token or artist_token in query_token:
-                    score += 1
-        
-        if score > best_score:
-            best_score = score
-            best_match = artist
-    
-    if best_score >= 1:
-        return best_match
-    
-    return None
-
-
-def extract_artist_from_query(query: str, available_titles: List[str]) -> Optional[str]:
-
-    q_lower = query.lower()
-    
-    stop_words = ['songs', 'song', 'music', 'by', 'from', 'what', 'which', 'show', 'me', 
-                  'did', 'i', 'listen', 'to', 'today', 'yesterday', 'last', 'week', 
-                  'the', 'a', 'an', 'my', 'all', 'any', 'that']
-    
-    words = q_lower.split()
-    query_tokens = [w for w in words if w not in stop_words and len(w) > 2]
-    
-    if not query_tokens:
-        return None
-    
-    all_artists = set()
-    for title in available_titles:
-        title_lower = title.lower()
-        
-        if ' - ' in title:
-            main_artist = title.split(' - ', 1)[0].strip()
-            main_artist = re.sub(r'^\(\d+\)\s*', '', main_artist)
-            all_artists.add(main_artist)
-        
-        feat_patterns = [
-            r'\(feat\.?\s+([^)]+)\)',
-            r'\(ft\.?\s+([^)]+)\)',
-            r'feat\.?\s+([^,\)]+)',
-            r'ft\.?\s+([^,\)]+)',
-            r'featuring\s+([^,\)]+)',
-            r'with\s+([^,\)]+)'
-        ]
-        
-        for pattern in feat_patterns:
-            matches = re.finditer(pattern, title_lower)
-            for match in matches:
-                feat_artist = match.group(1).strip()
-                feat_artist = re.sub(r'^\(\d+\)\s*', '', feat_artist)
-                all_artists.add(feat_artist)
-    
-    best_match = None
-    best_score = 0
-    
-    for artist in all_artists:
-        artist_lower = artist.lower()
-        artist_tokens = artist_lower.split()
-        
-        if artist_lower in q_lower:
-            return artist
-        
-        score = 0
-        for query_token in query_tokens:
-            for artist_token in artist_tokens:
-                if query_token == artist_token:
-                    score += 2
-                elif query_token in artist_token or artist_token in query_token:
-                    score += 1
-        
-        if score > best_score:
-            best_score = score
-            best_match = artist
-    
-    if best_score >= 1:
-        return best_match
-    
-    return None
-
-
 @app.post("/api/chat/structured", response_model=ChatResponse)
 async def chat_structured(req: ChatRequest):
-    """Return structured results with dynamic artist filtering including featured artists"""
+    """Structured chat with Python-based filtering (no complex ChromaDB where clauses)"""
     try:
         ensure_api_key()
         user_id = get_user_id(req.user_id)
@@ -712,7 +446,6 @@ async def chat_structured(req: ChatRequest):
 
         date_filter = extract_date(req.message)
         domain_filter = extract_domain(req.message)
-        where_hist = build_where(date_filter, domain_filter)
 
         enhanced = req.message
         if date_filter:
@@ -764,41 +497,68 @@ async def chat_structured(req: ChatRequest):
 
         res_h = hist.query(
             query_embeddings=[qvec], 
-            n_results=min(req.top_k * 5, 150),
-            **({"where": where_hist} if where_hist else {})
+            n_results=min(req.top_k * 5, 200)
         )
         docs_h = (res_h.get("documents") or [[]])[0]
         metas_h = (res_h.get("metadatas") or [[]])[0]
 
         if not docs_h:
-            return ChatResponse(
-                success=True,
-                answer="No matching history found.",
-                sources=[]
-            )
+            return ChatResponse(success=True, answer="No matching history found.", sources=[])
 
+        # PYTHON POST-FILTERING by date and domain
+        if date_filter or domain_filter:
+            filtered_docs = []
+            filtered_metas = []
+            
+            for i, meta in enumerate(metas_h):
+                match = True
+                
+                # Date filter
+                if date_filter:
+                    visit_date = meta.get('visit_date', '')
+                    if len(date_filter) == 7:  # Month YYYY-MM
+                        if not visit_date.startswith(date_filter):
+                            match = False
+                    else:  # Exact date YYYY-MM-DD
+                        if visit_date != date_filter:
+                            match = False
+                
+                # Domain filter
+                if domain_filter:
+                    if meta.get('domain', '') != domain_filter:
+                        match = False
+                
+                if match:
+                    filtered_docs.append(docs_h[i])
+                    filtered_metas.append(meta)
+            
+            docs_h = filtered_docs
+            metas_h = filtered_metas
+
+        # Extract artist filter
         available_titles = [meta.get('title', '') for meta in metas_h]
-        
         artist_filter = None
         if is_music_query:
             artist_filter = extract_artist_from_query(req.message, available_titles)
         
-        filtered_docs = []
-        filtered_metas = []
+        # FILTER by exclusions and artist
+        final_docs = []
+        final_metas = []
         
         for i, meta in enumerate(metas_h):
             title = meta.get('title', '')
             title_lower = title.lower()
-            url = meta.get('url', '').lower()
             domain = meta.get('domain', '').lower()
             category = meta.get('content_category', '').lower()
             
             should_exclude = False
             
+            # Artist filtering
             if artist_filter and is_music_query:
                 if artist_filter.lower() not in title_lower:
                     should_exclude = True
             
+            # Music exclusion
             if exclude_music:
                 if any(indicator in title_lower for indicator in [
                     'official audio', 'official video', 'music video', 'lyric', 
@@ -811,30 +571,26 @@ async def chat_structured(req: ChatRequest):
                 elif category in ['media', 'music streaming']:
                     should_exclude = True
             
+            # YouTube exclusion
             if exclude_youtube:
                 if 'youtube.com' in domain:
                     should_exclude = True
             
             if not should_exclude:
-                filtered_docs.append(docs_h[i])
-                filtered_metas.append(meta)
+                final_docs.append(docs_h[i] if i < len(docs_h) else '')
+                final_metas.append(meta)
         
-        docs_h = filtered_docs[:req.top_k]
-        metas_h = filtered_metas[:req.top_k]
+        docs_h = final_docs[:req.top_k]
+        metas_h = final_metas[:req.top_k]
         
         if not docs_h:
             if artist_filter:
-                return ChatResponse(
-                    success=True,
-                    answer=f"No songs featuring {artist_filter} found in your history.",
-                    sources=[]
-                )
-            return ChatResponse(
-                success=True,
-                answer="After filtering, no matching results found.",
-                sources=[]
-            )
+                return ChatResponse(success=True, answer=f"No songs featuring {artist_filter} found.", sources=[])
+            if date_filter and domain_filter:
+                return ChatResponse(success=True, answer=f"No {domain_filter} activity found from {date_filter}.", sources=[])
+            return ChatResponse(success=True, answer="No matching results found.", sources=[])
 
+        # BUILD ANSWER
         answer_lines = []
         
         if is_music_query:
@@ -843,7 +599,6 @@ async def chat_structured(req: ChatRequest):
             
             for i, meta in enumerate(metas_h):
                 title = meta.get('title', '')
-                
                 title_display = re.sub(r'^\(\d+\)\s*', '', title)
                 
                 title_clean = title_display.lower().strip()
@@ -859,7 +614,7 @@ async def chat_structured(req: ChatRequest):
                     parts = title_display.split(' - ', 1)
                     artist = parts[0].strip()
                     song = parts[1].strip()
-                    song = re.sub(r'\s*\[(Official|Music|Audio|Video|MV|Lyric|Official Music Video)\]', '', song, flags=re.IGNORECASE).strip()
+                    song = re.sub(r'\s*[\(\[].*?[\)\]]', '', song).strip()
                 
                 artist_count = 1
                 if ', ' in artist or ' & ' in artist or ' feat' in artist.lower() or ' ft.' in artist.lower():
@@ -882,12 +637,12 @@ async def chat_structured(req: ChatRequest):
                     'context': ', '.join(context_info) if context_info else ''
                 })
             
+            # Build answer
             if artist_filter:
                 answer_lines.append(f"Songs featuring {artist_filter}:\n")
                 for song in unique_songs[:20]:
                     context_str = f" ({song['context']})" if song['context'] else ""
                     answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
-            
             elif any(word in q_lower for word in ['3 people', 'three people', 'three artist', '3 artist']):
                 filtered = [s for s in unique_songs if s['artist_count'] >= 3]
                 if filtered:
@@ -896,10 +651,9 @@ async def chat_structured(req: ChatRequest):
                         context_str = f" ({song['context']})" if song['context'] else ""
                         answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
                 else:
-                    answer_lines.append("No songs with exactly 3 artists found.\n")
+                    answer_lines.append("No songs with 3 artists found.\n")
                     for song in unique_songs[:10]:
                         answer_lines.append(f"• {song['artist']} - {song['song']} [#{song['citation']}]")
-            
             elif any(word in q_lower for word in ['piano', 'guitar', 'rain', 'danc', 'beach', 'night']):
                 filtered = [s for s in unique_songs if s['context'] and any(
                     keyword in q_lower for keyword in s['context'].lower().split(', ')
@@ -915,13 +669,11 @@ async def chat_structured(req: ChatRequest):
                     for song in unique_songs[:10]:
                         context_str = f" ({song['context']})" if song['context'] else ""
                         answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
-            
             else:
                 answer_lines.append(f"Here are the songs from your history:\n")
                 for song in unique_songs[:15]:
                     context_str = f" ({song['context']})" if song['context'] else ""
                     answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
-        
         else:
             if exclude_music:
                 answer_lines.append(f"Here's your non-music browsing activity:\n")
@@ -957,3 +709,7 @@ async def chat_structured(req: ChatRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat failed: {e}")
+
+@app.get("/health")
+async def health():
+    return {"status":"ok","ts": datetime.utcnow().isoformat()}
