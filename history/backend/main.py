@@ -221,25 +221,35 @@ def extract_domain(query: str) -> Optional[str]:
 
 def build_where(date_filter: Optional[str], domain_filter: Optional[str],
                 hour_filter: Optional[int]=None, day_filter: Optional[int]=None) -> Dict[str, Any]:
-    where: Dict[str, Any] = {}
+    
+    conditions = []
     
     if date_filter:
-        if len(date_filter) == 7:
-            where["visit_date"] = {
-                "$gte": f"{date_filter}-01",
-                "$lte": f"{date_filter}-31"
-            }
-        else:
-            where["visit_date"] = {"$eq": date_filter}
+        if len(date_filter) == 7: 
+            conditions.append({
+                "visit_date": {
+                    "$gte": f"{date_filter}-01",
+                    "$lte": f"{date_filter}-31"
+                }
+            })
+        else:  
+            conditions.append({"visit_date": {"$eq": date_filter}})
     
-    if domain_filter: 
-        where["domain"] = {"$eq": domain_filter}
-    if hour_filter is not None: 
-        where["hour"] = {"$eq": hour_filter}
-    if day_filter is not None: 
-        where["dayOfWeek"] = {"$eq": day_filter}
+    if domain_filter:
+        conditions.append({"domain": {"$eq": domain_filter}})
     
-    return where
+    if hour_filter is not None:
+        conditions.append({"hour": {"$eq": hour_filter}})
+    
+    if day_filter is not None:
+        conditions.append({"dayOfWeek": {"$eq": day_filter}})
+    
+    if len(conditions) == 0:
+        return {}
+    elif len(conditions) == 1:
+        return conditions[0]
+    else:
+        return {"$and": conditions}
 
 def mk_sources(docs: List[str], metas: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
     out=[]
