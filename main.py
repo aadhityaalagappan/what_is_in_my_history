@@ -25,6 +25,7 @@ CHAT_MODEL = "gpt-4o-mini"
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_store")
 client = PersistentClient(path=CHROMA_DIR)
 
+# ===== Models =====
 class HistoryItem(BaseModel):
     id: str
     lastVisitTime: float
@@ -50,6 +51,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
 
+# ===== Helper Functions =====
 def ensure_api_key():
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
@@ -267,12 +269,13 @@ async def distill_and_store_memory(user_id: str, question: str, answer: str):
     mem_col.add(ids=[mem_id], documents=[summary], embeddings=vec, metadatas=[{"user_id":user_id, "ts":datetime.utcnow().isoformat()}])
 
 def extract_artist_from_query(query: str, available_titles: List[str]) -> Optional[str]:
-    """Dynamically extract artist name from query"""
+    """Dynamically extract artist name with better filtering"""
     q_lower = query.lower()
     
     stop_words = ['songs', 'song', 'music', 'by', 'from', 'what', 'which', 'show', 'me', 
                   'did', 'i', 'listen', 'to', 'today', 'yesterday', 'last', 'week', 
-                  'the', 'a', 'an', 'my', 'all', 'any', 'that', 'in', 'on']
+                  'the', 'a', 'an', 'my', 'all', 'any', 'that', 'in', 'on', 'this', 'give',
+                  'list', 'listened', 'heard', 'played']
     
     words = q_lower.split()
     query_tokens = [w for w in words if w not in stop_words and len(w) > 2]
@@ -282,20 +285,23 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
     
     all_artists = set()
     for title in available_titles:
+        title = re.sub(r'^\(\d+\)\s*', '', title)
         title_lower = title.lower()
+        
+        if len(title) > 100:
+            continue
         
         if ' - ' in title:
             main_artist = title.split(' - ', 1)[0].strip()
-            main_artist = re.sub(r'^\(\d+\)\s*', '', main_artist)
-            all_artists.add(main_artist)
+            word_count = len(main_artist.split())
+            if word_count <= 4:
+                all_artists.add(main_artist)
         
         feat_patterns = [
             r'\(feat\.?\s+([^)]+)\)',
             r'\(ft\.?\s+([^)]+)\)',
             r'feat\.?\s+([^,\)]+)',
-            r'ft\.?\s+([^,\)]+)',
-            r'featuring\s+([^,\)]+)',
-            r'with\s+([^,\)]+)'
+            r'ft\.?\s+([^,\)]+)'
         ]
         
         for pattern in feat_patterns:
@@ -303,12 +309,27 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
             for match in matches:
                 feat_artist = match.group(1).strip()
                 feat_artist = re.sub(r'^\(\d+\)\s*', '', feat_artist)
-                all_artists.add(feat_artist)
+                if len(feat_artist.split()) <= 4:
+                    for orig_title in available_titles:
+                        if feat_artist in orig_title.lower():
+                            start_idx = orig_title.lower().find(feat_artist)
+                            extracted = orig_title[start_idx:start_idx+len(feat_artist)]
+                            all_artists.add(extracted)
+                            break
+    
+    filtered_artists = set()
+    for artist in all_artists:
+        artist_lower = artist.lower()
+        blacklist = ['listening to', 'youtube', 'official', 'music video', 'lyric', 
+                     'audio', 'mv', 'video', 'cover', 'remix', 'spotify', 'top']
+        
+        if not any(bad in artist_lower for bad in blacklist):
+            filtered_artists.add(artist)
     
     best_match = None
     best_score = 0
     
-    for artist in all_artists:
+    for artist in filtered_artists:
         artist_lower = artist.lower()
         artist_tokens = artist_lower.split()
         
@@ -327,11 +348,12 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
             best_score = score
             best_match = artist
     
-    if best_score >= 1:
+    if best_score >= 2:
         return best_match
     
     return None
 
+# ===== Endpoints =====
 @app.post("/api/history/to_embeddings")
 async def rebuild_embeddings(batch: HistoryBatch):
     try:
@@ -437,7 +459,7 @@ async def upsert_items(batch: HistoryBatch):
 
 @app.post("/api/chat/structured", response_model=ChatResponse)
 async def chat_structured(req: ChatRequest):
-    """Structured chat with Python-based filtering (no complex ChromaDB where clauses)"""
+    """Structured chat with Python-based filtering"""
     try:
         ensure_api_key()
         user_id = get_user_id(req.user_id)
@@ -495,6 +517,7 @@ async def chat_structured(req: ChatRequest):
         
         qvec = await asyncio.to_thread(emb.embed_query, enhanced)
 
+        # Semantic search without where clause
         res_h = hist.query(
             query_embeddings=[qvec], 
             n_results=min(req.top_k * 5, 200)
@@ -505,7 +528,7 @@ async def chat_structured(req: ChatRequest):
         if not docs_h:
             return ChatResponse(success=True, answer="No matching history found.", sources=[])
 
-        # PYTHON POST-FILTERING by date and domain
+        # Python post-filtering by date and domain
         if date_filter or domain_filter:
             filtered_docs = []
             filtered_metas = []
@@ -513,17 +536,15 @@ async def chat_structured(req: ChatRequest):
             for i, meta in enumerate(metas_h):
                 match = True
                 
-                # Date filter
                 if date_filter:
                     visit_date = meta.get('visit_date', '')
-                    if len(date_filter) == 7:  # Month YYYY-MM
+                    if len(date_filter) == 7:
                         if not visit_date.startswith(date_filter):
                             match = False
-                    else:  # Exact date YYYY-MM-DD
+                    else:
                         if visit_date != date_filter:
                             match = False
                 
-                # Domain filter
                 if domain_filter:
                     if meta.get('domain', '') != domain_filter:
                         match = False
@@ -535,13 +556,13 @@ async def chat_structured(req: ChatRequest):
             docs_h = filtered_docs
             metas_h = filtered_metas
 
-        # Extract artist filter
+        # Extract artist filter dynamically
         available_titles = [meta.get('title', '') for meta in metas_h]
         artist_filter = None
         if is_music_query:
             artist_filter = extract_artist_from_query(req.message, available_titles)
         
-        # FILTER by exclusions and artist
+        # Filter by exclusions and artist
         final_docs = []
         final_metas = []
         
@@ -553,12 +574,10 @@ async def chat_structured(req: ChatRequest):
             
             should_exclude = False
             
-            # Artist filtering
             if artist_filter and is_music_query:
                 if artist_filter.lower() not in title_lower:
                     should_exclude = True
             
-            # Music exclusion
             if exclude_music:
                 if any(indicator in title_lower for indicator in [
                     'official audio', 'official video', 'music video', 'lyric', 
@@ -571,7 +590,6 @@ async def chat_structured(req: ChatRequest):
                 elif category in ['media', 'music streaming']:
                     should_exclude = True
             
-            # YouTube exclusion
             if exclude_youtube:
                 if 'youtube.com' in domain:
                     should_exclude = True
@@ -585,12 +603,12 @@ async def chat_structured(req: ChatRequest):
         
         if not docs_h:
             if artist_filter:
-                return ChatResponse(success=True, answer=f"No songs featuring {artist_filter} found.", sources=[])
+                return ChatResponse(success=True, answer=f"No songs by {artist_filter} found.", sources=[])
             if date_filter and domain_filter:
-                return ChatResponse(success=True, answer=f"No {domain_filter} activity found from {date_filter}.", sources=[])
+                return ChatResponse(success=True, answer=f"No {domain_filter} activity from {date_filter}.", sources=[])
             return ChatResponse(success=True, answer="No matching results found.", sources=[])
 
-        # BUILD ANSWER
+        # Build answer
         answer_lines = []
         
         if is_music_query:
@@ -637,22 +655,21 @@ async def chat_structured(req: ChatRequest):
                     'context': ', '.join(context_info) if context_info else ''
                 })
             
-            # Build answer
             if artist_filter:
-                answer_lines.append(f"Songs featuring {artist_filter}:\n")
-                for song in unique_songs[:20]:
+                answer_lines.append(f"Songs by {artist_filter}:\n")
+                for song in unique_songs[:30]:
                     context_str = f" ({song['context']})" if song['context'] else ""
-                    answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
+                    answer_lines.append(f"• {song['song']}{context_str} [#{song['citation']}]")
             elif any(word in q_lower for word in ['3 people', 'three people', 'three artist', '3 artist']):
                 filtered = [s for s in unique_songs if s['artist_count'] >= 3]
                 if filtered:
                     answer_lines.append(f"Songs with 3 or more artists:\n")
-                    for song in filtered[:5]:
+                    for song in filtered[:10]:
                         context_str = f" ({song['context']})" if song['context'] else ""
                         answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
                 else:
                     answer_lines.append("No songs with 3 artists found.\n")
-                    for song in unique_songs[:10]:
+                    for song in unique_songs[:15]:
                         answer_lines.append(f"• {song['artist']} - {song['song']} [#{song['citation']}]")
             elif any(word in q_lower for word in ['piano', 'guitar', 'rain', 'danc', 'beach', 'night']):
                 filtered = [s for s in unique_songs if s['context'] and any(
@@ -661,17 +678,17 @@ async def chat_structured(req: ChatRequest):
                 
                 if filtered:
                     answer_lines.append(f"Songs matching your description:\n")
-                    for song in filtered[:10]:
+                    for song in filtered[:15]:
                         context_str = f" ({song['context']})" if song['context'] else ""
                         answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
                 else:
                     answer_lines.append(f"Based on your description:\n")
-                    for song in unique_songs[:10]:
+                    for song in unique_songs[:15]:
                         context_str = f" ({song['context']})" if song['context'] else ""
                         answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
             else:
                 answer_lines.append(f"Here are the songs from your history:\n")
-                for song in unique_songs[:15]:
+                for song in unique_songs[:30]:
                     context_str = f" ({song['context']})" if song['context'] else ""
                     answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
         else:
@@ -699,7 +716,7 @@ async def chat_structured(req: ChatRequest):
                 if len(by_category) > 1:
                     answer_lines.append(f"\n**{category}:**")
                 
-                for item in items[:5]:
+                for item in items[:10]:
                     answer_lines.append(f"• {item['title']} ({item['domain']}) [#{item['citation']}]")
         
         answer = "\n".join(answer_lines)
@@ -708,7 +725,14 @@ async def chat_structured(req: ChatRequest):
         return ChatResponse(success=True, answer=answer, sources=sources)
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat failed: {e}")
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"ERROR in chat_structured: {error_detail}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    return await chat_structured(req)
 
 @app.get("/health")
 async def health():
