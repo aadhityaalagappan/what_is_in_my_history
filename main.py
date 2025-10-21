@@ -212,13 +212,25 @@ def extract_date(query: str) -> Optional[str]:
     return None
 
 def extract_domain(query: str) -> Optional[str]:
+    """Extract domain but be flexible - don't filter too strictly for music queries"""
     q = query.lower()
+    
+    # Only apply strict domain filter if explicitly mentioned AND not a music query
+    is_music_query = any(word in q for word in ['song', 'music', 'sing', 'artist', 'track'])
+    
+    # If it's a music query with "youtube", don't filter - let semantic search work
+    if is_music_query and 'youtube' in q:
+        return None  # Let semantic search handle it
+    
     mapping = {
-        'youtube':'youtube.com','spotify':'spotify.com','github':'github.com','leetcode':'leetcode.com',
-        'google docs':'docs.google.com','gmail':'mail.google.com','x.com':'x.com','twitter':'x.com'
+        'github':'github.com','leetcode':'leetcode.com',
+        'google docs':'docs.google.com','gmail':'mail.google.com','x.com':'x.com','twitter':'x.com',
+        'spotify':'spotify.com'  # Only filter Spotify if explicitly mentioned
     }
+    
     for k,v in mapping.items():
         if k in q: return v
+    
     return None
 
 def mk_sources(docs: List[str], metas: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
@@ -275,7 +287,7 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
     stop_words = ['songs', 'song', 'music', 'by', 'from', 'what', 'which', 'show', 'me', 
                   'did', 'i', 'listen', 'to', 'today', 'yesterday', 'last', 'week', 
                   'the', 'a', 'an', 'my', 'all', 'any', 'that', 'in', 'on', 'this', 'give',
-                  'list', 'listened', 'heard', 'played']
+                  'list', 'listened', 'heard', 'played', 'youtube', 'spotify']
     
     words = q_lower.split()
     query_tokens = [w for w in words if w not in stop_words and len(w) > 2]
@@ -288,15 +300,24 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
         title = re.sub(r'^\(\d+\)\s*', '', title)
         title_lower = title.lower()
         
+        # Skip overly long titles
         if len(title) > 100:
             continue
         
+        # Extract main artist (before " - ")
         if ' - ' in title:
             main_artist = title.split(' - ', 1)[0].strip()
             word_count = len(main_artist.split())
+            
+            # Filter: artist names are usually 1-4 words
             if word_count <= 4:
-                all_artists.add(main_artist)
+                # Additional filter: skip if it looks like a sentence
+                blacklist_phrases = ['listening to', 'top 10', 'how to', 'what is', 
+                                    'best of', 'compilation', 'playlist']
+                if not any(phrase in main_artist.lower() for phrase in blacklist_phrases):
+                    all_artists.add(main_artist)
         
+        # Extract featured artists
         feat_patterns = [
             r'\(feat\.?\s+([^)]+)\)',
             r'\(ft\.?\s+([^)]+)\)',
@@ -310,22 +331,20 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
                 feat_artist = match.group(1).strip()
                 feat_artist = re.sub(r'^\(\d+\)\s*', '', feat_artist)
                 if len(feat_artist.split()) <= 4:
-                    for orig_title in available_titles:
-                        if feat_artist in orig_title.lower():
-                            start_idx = orig_title.lower().find(feat_artist)
-                            extracted = orig_title[start_idx:start_idx+len(feat_artist)]
-                            all_artists.add(extracted)
-                            break
+                    all_artists.add(feat_artist.title())
     
+    # Filter out bad artist names
     filtered_artists = set()
     for artist in all_artists:
         artist_lower = artist.lower()
-        blacklist = ['listening to', 'youtube', 'official', 'music video', 'lyric', 
-                     'audio', 'mv', 'video', 'cover', 'remix', 'spotify', 'top']
+        blacklist = ['youtube', 'official', 'music video', 'lyric', 
+                     'audio', 'mv', 'video', 'cover', 'remix', 'spotify', 
+                     'top', 'playlist', 'compilation']
         
         if not any(bad in artist_lower for bad in blacklist):
             filtered_artists.add(artist)
     
+    # Match against query
     best_match = None
     best_score = 0
     
@@ -333,9 +352,11 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
         artist_lower = artist.lower()
         artist_tokens = artist_lower.split()
         
+        # Exact match
         if artist_lower in q_lower:
             return artist
         
+        # Token matching
         score = 0
         for query_token in query_tokens:
             for artist_token in artist_tokens:
@@ -348,6 +369,7 @@ def extract_artist_from_query(query: str, available_titles: List[str]) -> Option
             best_score = score
             best_match = artist
     
+    # Require higher confidence
     if best_score >= 2:
         return best_match
     
@@ -459,7 +481,7 @@ async def upsert_items(batch: HistoryBatch):
 
 @app.post("/api/chat/structured", response_model=ChatResponse)
 async def chat_structured(req: ChatRequest):
-    """Structured chat with Python-based filtering"""
+    """Structured chat with flexible filtering"""
     try:
         ensure_api_key()
         user_id = get_user_id(req.user_id)
@@ -485,42 +507,47 @@ async def chat_structured(req: ChatRequest):
         
         exclude_music = any(phrase in q_lower for phrase in [
             'apart from song', 'except song', 'besides song', 
-            'other than song', 'excluding song', 'not song', 'no song'
+            'other than song', 'excluding song', 'not song', 'no song', 'not music'
         ])
-        
-        exclude_youtube = 'apart from youtube' in q_lower or 'except youtube' in q_lower
         
         is_music_query = (
             not exclude_music and 
-            any(word in q_lower for word in ['song', 'music', 'sing', 'artist', 'track'])
+            any(word in q_lower for word in ['song', 'music', 'sing', 'artist', 'track', 'listen'])
         )
         
+        # Enhanced query expansion for better semantic search
         if is_music_query:
-            enhanced += " music audio video song"
+            enhanced += " music audio video song youtube spotify"
             
+            # Visual/contextual expansion
             if 'piano' in q_lower:
-                enhanced += " piano acoustic instrumental"
+                enhanced += " piano acoustic instrumental keys"
             if 'guitar' in q_lower:
-                enhanced += " guitar acoustic"
+                enhanced += " guitar acoustic strings"
             if 'rain' in q_lower:
-                enhanced += " rain"
+                enhanced += " rain rainy wet"
             if 'danc' in q_lower:
-                enhanced += " dancing dance"
-            if any(word in q_lower for word in ['girl', 'woman', 'female', 'she']):
-                enhanced += " female woman girl"
-            if any(word in q_lower for word in ['boy', 'man', 'male', 'he']):
-                enhanced += " male man boy"
-            if 'duet' in q_lower or 'together' in q_lower:
-                enhanced += " duet collaboration featuring"
+                enhanced += " dancing dance choreography"
+            
+            # Gender/people expansion
+            if any(word in q_lower for word in ['girl', 'woman', 'female', 'she', 'lady']):
+                enhanced += " female woman girl lady singer vocalist"
+            if any(word in q_lower for word in ['boy', 'man', 'male', 'he', 'guy']):
+                enhanced += " male man boy guy singer vocalist"
+            
+            # Collaboration expansion
+            if any(word in q_lower for word in ['duet', 'together', 'with', 'and']):
+                enhanced += " duet collaboration featuring ft feat with"
+        
         elif exclude_music:
-            enhanced += " browsing web article page website"
+            enhanced += " browsing web article page website reading"
         
         qvec = await asyncio.to_thread(emb.embed_query, enhanced)
 
-        # Semantic search without where clause
+        # Get more results for better filtering
         res_h = hist.query(
             query_embeddings=[qvec], 
-            n_results=min(req.top_k * 5, 200)
+            n_results=min(req.top_k * 6, 250)
         )
         docs_h = (res_h.get("documents") or [[]])[0]
         metas_h = (res_h.get("metadatas") or [[]])[0]
@@ -528,29 +555,35 @@ async def chat_structured(req: ChatRequest):
         if not docs_h:
             return ChatResponse(success=True, answer="No matching history found.", sources=[])
 
-        # Python post-filtering by date and domain
-        if date_filter or domain_filter:
+        # PYTHON POST-FILTERING by date (domain filtering removed for music queries)
+        if date_filter:
             filtered_docs = []
             filtered_metas = []
             
             for i, meta in enumerate(metas_h):
-                match = True
+                visit_date = meta.get('visit_date', '')
                 
-                if date_filter:
-                    visit_date = meta.get('visit_date', '')
-                    if len(date_filter) == 7:
-                        if not visit_date.startswith(date_filter):
-                            match = False
-                    else:
-                        if visit_date != date_filter:
-                            match = False
-                
-                if domain_filter:
-                    if meta.get('domain', '') != domain_filter:
-                        match = False
-                
-                if match:
-                    filtered_docs.append(docs_h[i])
+                # Date matching
+                if len(date_filter) == 7:  # Month YYYY-MM
+                    if visit_date.startswith(date_filter):
+                        filtered_docs.append(docs_h[i])
+                        filtered_metas.append(meta)
+                else:  # Exact date YYYY-MM-DD
+                    if visit_date == date_filter:
+                        filtered_docs.append(docs_h[i])
+                        filtered_metas.append(meta)
+            
+            docs_h = filtered_docs
+            metas_h = filtered_metas
+        
+        # Apply non-music domain filter only if not a music query
+        if domain_filter and not is_music_query:
+            filtered_docs = []
+            filtered_metas = []
+            
+            for i, meta in enumerate(metas_h):
+                if meta.get('domain', '') == domain_filter:
+                    filtered_docs.append(docs_h[i] if i < len(docs_h) else '')
                     filtered_metas.append(meta)
             
             docs_h = filtered_docs
@@ -562,7 +595,7 @@ async def chat_structured(req: ChatRequest):
         if is_music_query:
             artist_filter = extract_artist_from_query(req.message, available_titles)
         
-        # Filter by exclusions and artist
+        # FILTER by exclusions and artist
         final_docs = []
         final_metas = []
         
@@ -574,24 +607,23 @@ async def chat_structured(req: ChatRequest):
             
             should_exclude = False
             
+            # Artist filtering
             if artist_filter and is_music_query:
                 if artist_filter.lower() not in title_lower:
                     should_exclude = True
             
+            # Music exclusion (for "apart from songs" queries)
             if exclude_music:
-                if any(indicator in title_lower for indicator in [
-                    'official audio', 'official video', 'music video', 'lyric', 
-                    'lyrics', '(audio)', '(official)', 'ft.', 'feat.'
-                ]):
-                    should_exclude = True
-                elif domain in ['youtube.com', 'music.youtube.com']:
-                    if any(term in title_lower for term in [' - ', 'official', 'audio', 'music', 'ft', 'feat']):
-                        should_exclude = True
-                elif category in ['media', 'music streaming']:
-                    should_exclude = True
-            
-            if exclude_youtube:
-                if 'youtube.com' in domain:
+                is_likely_music = (
+                    any(indicator in title_lower for indicator in [
+                        'official audio', 'official video', 'music video', 'lyric', 
+                        'lyrics', '(audio)', '(official)', ' - '
+                    ]) or
+                    domain in ['youtube.com', 'music.youtube.com', 'spotify.com'] and
+                    any(term in title_lower for term in ['official', 'audio', 'music', 'ft', 'feat', ' - '])
+                )
+                
+                if is_likely_music:
                     should_exclude = True
             
             if not should_exclude:
@@ -604,11 +636,11 @@ async def chat_structured(req: ChatRequest):
         if not docs_h:
             if artist_filter:
                 return ChatResponse(success=True, answer=f"No songs by {artist_filter} found.", sources=[])
-            if date_filter and domain_filter:
-                return ChatResponse(success=True, answer=f"No {domain_filter} activity from {date_filter}.", sources=[])
+            if date_filter:
+                return ChatResponse(success=True, answer=f"No history found from {date_filter}.", sources=[])
             return ChatResponse(success=True, answer="No matching results found.", sources=[])
 
-        # Build answer
+        # BUILD ANSWER
         answer_lines = []
         
         if is_music_query:
@@ -655,11 +687,13 @@ async def chat_structured(req: ChatRequest):
                     'context': ', '.join(context_info) if context_info else ''
                 })
             
+            # Build answer based on query type
             if artist_filter:
                 answer_lines.append(f"Songs by {artist_filter}:\n")
                 for song in unique_songs[:30]:
                     context_str = f" ({song['context']})" if song['context'] else ""
                     answer_lines.append(f"• {song['song']}{context_str} [#{song['citation']}]")
+            
             elif any(word in q_lower for word in ['3 people', 'three people', 'three artist', '3 artist']):
                 filtered = [s for s in unique_songs if s['artist_count'] >= 3]
                 if filtered:
@@ -668,30 +702,26 @@ async def chat_structured(req: ChatRequest):
                         context_str = f" ({song['context']})" if song['context'] else ""
                         answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
                 else:
-                    answer_lines.append("No songs with 3 artists found.\n")
+                    answer_lines.append("No songs with 3+ artists found.\n")
                     for song in unique_songs[:15]:
                         answer_lines.append(f"• {song['artist']} - {song['song']} [#{song['citation']}]")
-            elif any(word in q_lower for word in ['piano', 'guitar', 'rain', 'danc', 'beach', 'night']):
-                filtered = [s for s in unique_songs if s['context'] and any(
-                    keyword in q_lower for keyword in s['context'].lower().split(', ')
-                )]
-                
-                if filtered:
-                    answer_lines.append(f"Songs matching your description:\n")
-                    for song in filtered[:15]:
-                        context_str = f" ({song['context']})" if song['context'] else ""
-                        answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
-                else:
-                    answer_lines.append(f"Based on your description:\n")
-                    for song in unique_songs[:15]:
-                        context_str = f" ({song['context']})" if song['context'] else ""
-                        answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
+            
+            elif any(word in q_lower for word in ['piano', 'guitar', 'rain', 'danc', 'beach', 'night', 'man', 'woman', 'boy', 'girl']):
+                # Descriptive query - use contextual keywords
+                answer_lines.append(f"Songs matching your description:\n")
+                for song in unique_songs[:20]:
+                    context_str = f" ({song['context']})" if song['context'] else ""
+                    answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
+            
             else:
+                # General music listing
                 answer_lines.append(f"Here are the songs from your history:\n")
                 for song in unique_songs[:30]:
                     context_str = f" ({song['context']})" if song['context'] else ""
                     answer_lines.append(f"• {song['artist']} - {song['song']}{context_str} [#{song['citation']}]")
+        
         else:
+            # Non-music query
             if exclude_music:
                 answer_lines.append(f"Here's your non-music browsing activity:\n")
             else:
@@ -732,6 +762,7 @@ async def chat_structured(req: ChatRequest):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    """Fallback endpoint - redirects to structured"""
     return await chat_structured(req)
 
 @app.get("/health")
